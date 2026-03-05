@@ -2,6 +2,8 @@
 #include <vector>
 #include <unordered_map>
 #include <memory>
+#include <mutex>
+#include "ThreadPool.h"
 #include "Socket.h"
 #include "Epoll.h"
 #include "InetAddress.h"
@@ -18,12 +20,29 @@ int main() {
     serv_sock.setNonBlocking();
     //监听Socket用ET模式，达到高性能处理
     ep.addFd(serv_sock.getFd(),EPOLLIN|EPOLLET);
+    auto dead_fds=std::make_shared<std::vector<std::pair<int,std::weak_ptr<HttpConnection>>>>();
+    auto dead_mtx=std::make_shared<std::mutex>();
+    ThreadPool pool(8);
+    //堆分配死亡名单和线程池
     //连接池，映射
     std::unordered_map<int,std::shared_ptr<HttpConnection>> connections;
     std::cout<<"HighPerfWebServer running on port 8888……"<<std::endl;
     while (true) {
+        //主线程安全清理僵尸连接
+        {
+            std::lock_guard<std::mutex> lock(*dead_mtx);
+            for (auto& dead_node:*dead_fds) {
+                int dead_fd=dead_node.first;
+                auto weak_conn=dead_node.second;
+                //ABA免疫检查
+                if (connections.count(dead_fd)&&connections[dead_fd]==weak_conn.lock()) {
+                    connections.erase(dead_fd);
+                }
+            }
+            dead_fds->clear();
+        }
         std::vector<epoll_event> active_events;
-        ep.poll(active_events);
+        ep.poll(active_events,10);//10ms超时时间，防止阻塞
         for (auto& event: active_events) {
             int fd=event.data.fd;
             //场景A:有新的客户端连接
@@ -49,17 +68,29 @@ int main() {
                 if (connections.count(fd)==0)
                     continue;
                 auto conn=connections[fd];
-                if (event.events&(EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-                    connections.erase(fd);
-                    continue; // 既然清理了，就不往下走,不再读写
+                //1.拦截错误事件，
+                if (event.events&(EPOLLERR|EPOLLHUP)) {
+                    ep.delFd(fd);
+                    std::lock_guard<std::mutex> lock(*dead_mtx);
+                    dead_fds->push_back({fd,std::weak_ptr<HttpConnection>(conn)});
+                    continue;
                 }
-                if (event.events&EPOLLIN) {
-                    conn->handleRead(ep);
-                }
-                if (event.events&EPOLLOUT) {
-                    conn->handleWrite(ep);
-                }
-
+                int events=event.events;
+                //2.扔进线程池异步处理
+                pool.addTask([conn,fd,events,&ep,dead_mtx,dead_fds]() {
+                    if (events&(EPOLLIN|EPOLLRDHUP)) {
+                        conn->handleRead(ep);
+                    }
+                    //排他性写，防止大文件双重触发写操作
+                    else if (events& EPOLLOUT) {
+                        conn->handleWrite(ep);
+                    }
+                    //3.worker处理完后检查并汇报死亡
+                    if (conn->isClosed()) {
+                        std::lock_guard<std::mutex> lock(*dead_mtx);
+                        dead_fds->push_back({fd,std::weak_ptr<HttpConnection>(conn)});
+                    }
+                });
             }
         }
 

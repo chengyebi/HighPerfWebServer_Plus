@@ -57,4 +57,11 @@ void Epoll::modFd(int fd,uint32_t events) {
     if (epoll_ctl(epfd_,EPOLL_CTL_MOD,fd,&ev)==-1) {
         throw std::runtime_error("epoll mod event error");
     }
+
+}
+void Epoll::delFd(int fd) {
+    //摘除时传nullptr即可
+    if (epoll_ctl(epfd_,EPOLL_CTL_DEL,fd,nullptr)==-1) {
+
+    }
 }

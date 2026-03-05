@@ -20,6 +20,7 @@ public:
     void addFd(int fd,uint32_t op);
     //让epoll类有动态修改监听事件的能力
     void modFd(int fd,uint32_t events);
+    void delFd(int fd);
     //核心接口：等待事件发生
     //time_out:超时时间，-1表示永久阻塞，
     //返回活跃事件的组合（这里也可以返回int,然后提供getEvents(),但是直接填充到vector更方便；
