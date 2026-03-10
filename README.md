@@ -1,6 +1,6 @@
 # HighPerfWebServer
 
-基于 C++11 与 Epoll 的高并发 HTTP 服务器。在 8 核环境、2 万并发连接压测下，峰值吞吐量达 **186,000 QPS**。
+基于 C++11 与 Epoll 的高并发 HTTP 服务器。使用 wrk 进行单机多梯度并发压测（1k - 20k 连接），在 16 线程、2 万并发场景下，峰值吞吐量达 **200,000 QPS**，平均响应时间 105ms，P99 延迟 281ms。
 
 ## 项目架构
 
@@ -54,14 +54,21 @@ HighPerfWebServer/
 
 ## 快速开始
 
-**环境要求**：Linux、GCC 7+、CMake 3.10+
+**环境要求**：Linux 或 WSL2、GCC 7+、CMake 3.10+、wrk
 
 ```bash
+# 克隆项目
 git clone https://github.com/chengyebi/HighPerfWebServer.git
 cd HighPerfWebServer
-mkdir build && cd build
+
+# 编译
+mkdir -p build && cd build
 cmake .. && make
-./server
+cd ..
+
+# 运行服务器
+ulimit -n 65535
+./build/server
 ```
 
 服务器默认监听 `127.0.0.1:8888`，静态资源放在项目根目录的 `resources/` 下。
@@ -69,10 +76,26 @@ cmake .. && make
 ```bash
 # 访问测试
 curl http://127.0.0.1:8888/
-
-# 压测（需安装 wrk）
-wrk -t8 -c20000 -d30s http://127.0.0.1:8888/
 ```
+
+## 压测
+
+新开一个终端，执行：
+
+```bash
+ulimit -n 65535
+wrk -t16 -c20000 -d30s --latency http://127.0.0.1:8888/
+```
+
+### 压测结果（单机，WSL2 环境）
+
+| 线程数 | 并发连接数 | QPS | 平均延迟 | P99 延迟 |
+|--------|-----------|-----|---------|---------|
+| 4 | 1,000 | 18,593 | - | - |
+| 8 | 5,000 | 82,252 | - | - |
+| 8 | 10,000 | 124,879 | - | - |
+| 8 | 20,000 | 183,342 | - | - |
+| 16 | 20,000 | **200,954** | 105ms | 281ms |
 
 ## 核心模块说明
 
