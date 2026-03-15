@@ -3,6 +3,7 @@
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <csignal>
 #include "ThreadPool.h"
 #include "Socket.h"
 #include "Epoll.h"
@@ -10,6 +11,7 @@
 #include "HttpConnection.h"
 
 int main() {
+    signal(SIGPIPE, SIG_IGN);
     //建立监听，
     Socket serv_sock;
     InetAddress serv_addr("127.0.0.1",8888);
