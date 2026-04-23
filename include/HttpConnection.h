@@ -4,14 +4,20 @@
 #include "Epoll.h"
 #include "HttpRequest.h"
 #include "ServerConfig.h"
+#include "ServerLogger.h"
 #include "ServerMetrics.h"
 #include "Socket.h"
+#include <cstdint>
+#include <atomic>
 #include <memory>
 #include <string>
 
 class HttpConnection {
 public:
-    HttpConnection(int fd, const ServerConfig& config, std::shared_ptr<ServerMetrics> metrics);
+    HttpConnection(int fd,
+                   const ServerConfig& config,
+                   std::shared_ptr<ServerMetrics> metrics,
+                   std::shared_ptr<ServerLogger> logger);
     ~HttpConnection();
 
     HttpConnection(const HttpConnection&) = delete;
@@ -21,10 +27,14 @@ public:
     void handleRead(Epoll& ep);
     void handleWrite(Epoll& ep);
     bool isClosed() const;
+    bool isIdle(int64_t nowMs, int idleTimeoutMs) const;
+    void closeForTimeout();
+    int64_t lastActiveMs() const;
 
 private:
     void process();
     void closeConnection();
+    void touchActivity();
     void appendResponse(const std::string& status,
                         const std::string& contentType,
                         const std::string& body,
@@ -46,4 +56,6 @@ private:
     size_t fileLen_;
     ServerConfig config_;
     std::shared_ptr<ServerMetrics> metrics_;
+    std::shared_ptr<ServerLogger> logger_;
+    std::atomic<int64_t> lastActiveMs_;
 };

@@ -1,5 +1,6 @@
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
@@ -11,8 +12,10 @@
 
 #include "Epoll.h"
 #include "HttpConnection.h"
+#include "IdleTimerManager.h"
 #include "InetAddress.h"
 #include "ServerConfig.h"
+#include "ServerLogger.h"
 #include "ServerMetrics.h"
 #include "Socket.h"
 #include "ThreadPool.h"
@@ -26,7 +29,8 @@ void handleSignal(int) {
 
 void printUsage(const char* program) {
     std::cout << "Usage: " << program
-              << " [--host IP] [--port PORT] [--threads N] [--resources PATH]\n";
+              << " [--host IP] [--port PORT] [--threads N] [--resources PATH]"
+              << " [--log PATH] [--idle-timeout-ms N]\n";
 }
 
 bool parseArgs(int argc, char* argv[], ServerConfig& config) {
@@ -40,6 +44,10 @@ bool parseArgs(int argc, char* argv[], ServerConfig& config) {
             config.threadCount = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (arg == "--resources" && i + 1 < argc) {
             config.resourceRoot = argv[++i];
+        } else if (arg == "--log" && i + 1 < argc) {
+            config.logFilePath = argv[++i];
+        } else if (arg == "--idle-timeout-ms" && i + 1 < argc) {
+            config.idleTimeoutMs = std::stoi(argv[++i]);
         } else if (arg == "--help" || arg == "-h") {
             printUsage(argv[0]);
             return false;
@@ -64,6 +72,7 @@ int main(int argc, char* argv[]) {
     }
 
     auto metrics = std::make_shared<ServerMetrics>();
+    auto logger = std::make_shared<ServerLogger>(config.logFilePath);
 
     Socket servSock;
     InetAddress servAddr(config.host.c_str(), config.port);
@@ -77,12 +86,14 @@ int main(int argc, char* argv[]) {
     auto deadFds = std::make_shared<std::vector<std::pair<int, std::weak_ptr<HttpConnection>>>>();
     auto deadMtx = std::make_shared<std::mutex>();
     ThreadPool pool(config.threadCount);
+    IdleTimerManager timerManager(config.idleTimeoutMs);
     std::unordered_map<int, std::shared_ptr<HttpConnection>> connections;
 
-    std::cout << "HighPerfWebServer listening on " << config.host << ':' << config.port
-              << " with " << config.threadCount << " worker threads\n";
-    std::cout << "Static root: " << config.resourceRoot << '\n';
-    std::cout << "Built-in endpoints: /healthz , /metrics\n";
+    logger->info("HighPerfWebServer_Plus listening on " + config.host + ":" + std::to_string(config.port) +
+                 " with " + std::to_string(config.threadCount) + " worker threads");
+    logger->info("static root=" + config.resourceRoot +
+                 " log=" + config.logFilePath +
+                 " idle_timeout_ms=" + std::to_string(config.idleTimeoutMs));
 
     while (g_running.load()) {
         {
@@ -97,8 +108,19 @@ int main(int argc, char* argv[]) {
             deadFds->clear();
         }
 
+        for (const auto& conn : timerManager.collectExpired()) {
+            const int fd = conn->getFd();
+            if (fd == -1) {
+                continue;
+            }
+            ep.delFd(fd);
+            conn->closeForTimeout();
+            std::lock_guard<std::mutex> lock(*deadMtx);
+            deadFds->push_back({fd, std::weak_ptr<HttpConnection>(conn)});
+        }
+
         std::vector<epoll_event> activeEvents;
-        ep.poll(activeEvents, 100);
+        ep.poll(activeEvents, timerManager.nextPollTimeoutMs());
         for (const auto& event : activeEvents) {
             const int fd = event.data.fd;
             if (fd == servSock.getFd()) {
@@ -113,7 +135,9 @@ int main(int argc, char* argv[]) {
                     }
 
                     metrics->onAccept();
-                    connections[clientFd] = std::make_shared<HttpConnection>(clientFd, config, metrics);
+                    logger->info("accepted connection fd=" + std::to_string(clientFd));
+                    connections[clientFd] = std::make_shared<HttpConnection>(clientFd, config, metrics, logger);
+                    timerManager.schedule(connections[clientFd]);
                     ep.addFd(clientFd, EPOLLIN | EPOLLET | EPOLLONESHOT | EPOLLRDHUP);
                 }
                 continue;
@@ -132,12 +156,13 @@ int main(int argc, char* argv[]) {
             }
 
             const uint32_t events = event.events;
-            pool.addTask([conn, fd, events, &ep, deadMtx, deadFds]() {
+            pool.addTask([conn, fd, events, &ep, &timerManager, deadMtx, deadFds]() {
                 if (events & (EPOLLIN | EPOLLRDHUP)) {
                     conn->handleRead(ep);
                 } else if (events & EPOLLOUT) {
                     conn->handleWrite(ep);
                 }
+                timerManager.schedule(conn);
                 if (conn->isClosed()) {
                     std::lock_guard<std::mutex> lock(*deadMtx);
                     deadFds->push_back({fd, std::weak_ptr<HttpConnection>(conn)});
@@ -146,6 +171,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::cout << "Server shutting down\n";
+    logger->info("server shutting down");
     return 0;
 }

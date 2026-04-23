@@ -1,6 +1,7 @@
 #include "HttpConnection.h"
 
 #include <cerrno>
+#include <chrono>
 #include <fcntl.h>
 #include <sstream>
 #include <sys/sendfile.h>
@@ -8,6 +9,11 @@
 #include <unistd.h>
 
 namespace {
+int64_t nowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 std::string buildHeader(const std::string& status,
                         const std::string& contentType,
                         size_t contentLength,
@@ -22,7 +28,10 @@ std::string buildHeader(const std::string& status,
 }
 }
 
-HttpConnection::HttpConnection(int fd, const ServerConfig& config, std::shared_ptr<ServerMetrics> metrics)
+HttpConnection::HttpConnection(int fd,
+                               const ServerConfig& config,
+                               std::shared_ptr<ServerMetrics> metrics,
+                               std::shared_ptr<ServerLogger> logger)
     : socket_(fd),
       keepAlive_(false),
       headRequest_(false),
@@ -32,7 +41,9 @@ HttpConnection::HttpConnection(int fd, const ServerConfig& config, std::shared_p
       fileOffset_(0),
       fileLen_(0),
       config_(config),
-      metrics_(std::move(metrics)) {
+      metrics_(std::move(metrics)),
+      logger_(std::move(logger)),
+      lastActiveMs_(nowMs()) {
     socket_.setNonBlocking();
 }
 
@@ -55,6 +66,26 @@ bool HttpConnection::isClosed() const {
     return socket_.getFd() == -1;
 }
 
+int64_t HttpConnection::lastActiveMs() const {
+    return lastActiveMs_.load(std::memory_order_relaxed);
+}
+
+bool HttpConnection::isIdle(int64_t nowMsValue, int idleTimeoutMs) const {
+    return socket_.getFd() != -1 &&
+           idleTimeoutMs > 0 &&
+           (nowMsValue - lastActiveMs_.load(std::memory_order_relaxed)) >= idleTimeoutMs;
+}
+
+void HttpConnection::closeForTimeout() {
+    if (metrics_) {
+        metrics_->onTimeoutClose();
+    }
+    if (logger_) {
+        logger_->warn("closed idle connection fd=" + std::to_string(socket_.getFd()));
+    }
+    closeConnection();
+}
+
 void HttpConnection::closeConnection() {
     if (socket_.getFd() != -1) {
         socket_.close();
@@ -65,10 +96,15 @@ void HttpConnection::closeConnection() {
     }
 }
 
+void HttpConnection::touchActivity() {
+    lastActiveMs_.store(nowMs(), std::memory_order_relaxed);
+}
+
 void HttpConnection::appendResponse(const std::string& status,
                                     const std::string& contentType,
                                     const std::string& body,
                                     bool includeBody) {
+    touchActivity();
     outputBuffer_.append(buildHeader(status, contentType, body.size(), keepAlive_));
     if (includeBody && !body.empty()) {
         outputBuffer_.append(body);
@@ -80,6 +116,7 @@ void HttpConnection::appendResponse(const std::string& status,
 }
 
 void HttpConnection::serveMetrics(bool includeBody) {
+    touchActivity();
     if (metrics_) {
         metrics_->onResponse();
     }
@@ -132,6 +169,7 @@ void HttpConnection::handleRead(Epoll& ep) {
         len = inputBuffer_.readFd(socket_.getFd(), &saveErrno);
         if (len > 0 && metrics_) {
             metrics_->addBytesRead(static_cast<size_t>(len));
+            touchActivity();
         }
         if (len <= 0) {
             if (saveErrno == EAGAIN || saveErrno == EWOULDBLOCK) {
@@ -164,6 +202,7 @@ void HttpConnection::handleWrite(Epoll& ep) {
                 len = outputBuffer_.writeFd(socket_.getFd(), &saveErrno);
                 if (len > 0 && metrics_) {
                     metrics_->addBytesWritten(static_cast<size_t>(len));
+                    touchActivity();
                 }
                 if (len <= 0) {
                     if (saveErrno == EAGAIN || saveErrno == EWOULDBLOCK) {
@@ -186,6 +225,7 @@ void HttpConnection::handleWrite(Epoll& ep) {
                     if (metrics_) {
                         metrics_->addBytesWritten(static_cast<size_t>(sent));
                     }
+                    touchActivity();
                     if (fileOffset_ >= static_cast<off_t>(fileLen_)) {
                         close(fileFd_);
                         fileFd_ = -1;
@@ -257,6 +297,9 @@ void HttpConnection::process() {
                        "text/plain; charset=utf-8",
                        "Only GET and HEAD are supported.\n",
                        !headRequest_);
+        if (logger_) {
+            logger_->warn(request_.method() + " " + request_.path() + " -> 405");
+        }
         return;
     }
 
@@ -270,16 +313,25 @@ void HttpConnection::process() {
             metrics_->onClientError();
         }
         appendResponse("403 Forbidden", "text/html; charset=utf-8", "<h1>403 Forbidden</h1>", !headRequest_);
+        if (logger_) {
+            logger_->warn(request_.method() + " " + path + " -> 403");
+        }
         return;
     }
 
     if (path == "/healthz") {
         appendResponse("200 OK", "text/plain; charset=utf-8", "ok\n", !headRequest_);
+        if (logger_) {
+            logger_->info(request_.method() + " " + path + " -> 200");
+        }
         return;
     }
 
     if (path == "/metrics") {
         serveMetrics(!headRequest_);
+        if (logger_) {
+            logger_->info(request_.method() + " " + path + " -> 200");
+        }
         return;
     }
 
@@ -290,14 +342,21 @@ void HttpConnection::process() {
             metrics_->onClientError();
         }
         appendResponse("404 Not Found", "text/html; charset=utf-8", "<h1>404 Not Found</h1>", !headRequest_);
+        if (logger_) {
+            logger_->warn(request_.method() + " " + path + " -> 404");
+        }
         return;
     }
 
     if (headRequest_) {
         outputBuffer_.append(buildHeader("200 OK", detectMimeType(path), static_cast<size_t>(fileStat.st_size), keepAlive_));
+        touchActivity();
         responseReady_ = true;
         if (metrics_) {
             metrics_->onResponse();
+        }
+        if (logger_) {
+            logger_->info(request_.method() + " " + path + " -> 200");
         }
         return;
     }
@@ -311,14 +370,21 @@ void HttpConnection::process() {
                        "text/html; charset=utf-8",
                        "<h1>500 Internal Server Error</h1>",
                        true);
+        if (logger_) {
+            logger_->error(request_.method() + " " + path + " -> 500");
+        }
         return;
     }
 
     outputBuffer_.append(buildHeader("200 OK", detectMimeType(path), static_cast<size_t>(fileStat.st_size), keepAlive_));
+    touchActivity();
     fileLen_ = static_cast<size_t>(fileStat.st_size);
     fileOffset_ = 0;
     responseReady_ = true;
     if (metrics_) {
         metrics_->onResponse();
+    }
+    if (logger_) {
+        logger_->info(request_.method() + " " + path + " -> 200");
     }
 }

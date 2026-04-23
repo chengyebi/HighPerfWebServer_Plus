@@ -13,7 +13,9 @@ add_executable(server
     src/Epoll.cpp
     src/HttpConnection.cpp
     src/HttpRequest.cpp
+    src/IdleTimerManager.cpp
     src/InetAddress.cpp
+    src/ServerLogger.cpp
     src/Socket.cpp
 )
 

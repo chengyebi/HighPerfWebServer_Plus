@@ -34,6 +34,10 @@ public:
         totalServerErrors_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    void onTimeoutClose() {
+        timeoutCloses_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     void addBytesRead(size_t bytes) {
         bytesRead_.fetch_add(bytes, std::memory_order_relaxed);
     }
@@ -54,6 +58,7 @@ public:
             << "\"total_responses\":" << totalResponses_.load(std::memory_order_relaxed) << ","
             << "\"total_client_errors\":" << totalClientErrors_.load(std::memory_order_relaxed) << ","
             << "\"total_server_errors\":" << totalServerErrors_.load(std::memory_order_relaxed) << ","
+            << "\"timeout_closes\":" << timeoutCloses_.load(std::memory_order_relaxed) << ","
             << "\"bytes_read\":" << bytesRead_.load(std::memory_order_relaxed) << ","
             << "\"bytes_written\":" << bytesWritten_.load(std::memory_order_relaxed)
             << "}";
@@ -68,6 +73,7 @@ private:
     std::atomic<uint64_t> totalResponses_{0};
     std::atomic<uint64_t> totalClientErrors_{0};
     std::atomic<uint64_t> totalServerErrors_{0};
+    std::atomic<uint64_t> timeoutCloses_{0};
     std::atomic<uint64_t> bytesRead_{0};
     std::atomic<uint64_t> bytesWritten_{0};
 };
