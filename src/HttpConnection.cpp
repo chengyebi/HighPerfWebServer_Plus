@@ -321,17 +321,11 @@ void HttpConnection::process() {
 
     if (path == "/healthz") {
         appendResponse("200 OK", "text/plain; charset=utf-8", "ok\n", !headRequest_);
-        if (logger_) {
-            logger_->info(request_.method() + " " + path + " -> 200");
-        }
         return;
     }
 
     if (path == "/metrics") {
         serveMetrics(!headRequest_);
-        if (logger_) {
-            logger_->info(request_.method() + " " + path + " -> 200");
-        }
         return;
     }
 
@@ -354,9 +348,6 @@ void HttpConnection::process() {
         responseReady_ = true;
         if (metrics_) {
             metrics_->onResponse();
-        }
-        if (logger_) {
-            logger_->info(request_.method() + " " + path + " -> 200");
         }
         return;
     }
@@ -383,8 +374,5 @@ void HttpConnection::process() {
     responseReady_ = true;
     if (metrics_) {
         metrics_->onResponse();
-    }
-    if (logger_) {
-        logger_->info(request_.method() + " " + path + " -> 200");
     }
 }

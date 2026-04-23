@@ -30,10 +30,10 @@ public:
     bool isIdle(int64_t nowMs, int idleTimeoutMs) const;
     void closeForTimeout();
     int64_t lastActiveMs() const;
+    void closeConnection();
 
 private:
     void process();
-    void closeConnection();
     void touchActivity();
     void appendResponse(const std::string& status,
                         const std::string& contentType,

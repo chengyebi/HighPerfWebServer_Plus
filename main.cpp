@@ -1,30 +1,27 @@
 #include <atomic>
 #include <cerrno>
-#include <chrono>
 #include <csignal>
-#include <cstdlib>
+#include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <unordered_map>
+#include <unistd.h>
 #include <vector>
 
 #include "Epoll.h"
-#include "HttpConnection.h"
-#include "IdleTimerManager.h"
 #include "InetAddress.h"
 #include "ServerConfig.h"
 #include "ServerLogger.h"
 #include "ServerMetrics.h"
 #include "Socket.h"
-#include "ThreadPool.h"
+#include "SubReactor.h"
 
 namespace {
-std::atomic<bool> g_running{true};
+std::atomic<bool> gRunning{true};
 
 void handleSignal(int) {
-    g_running.store(false);
+    gRunning.store(false);
 }
 
 void printUsage(const char* program) {
@@ -73,104 +70,69 @@ int main(int argc, char* argv[]) {
 
     auto metrics = std::make_shared<ServerMetrics>();
     auto logger = std::make_shared<ServerLogger>(config.logFilePath);
+    if (config.threadCount == 0) {
+        config.threadCount = 1;
+    }
 
-    Socket servSock;
-    InetAddress servAddr(config.host.c_str(), config.port);
-    servSock.bind(servAddr);
-    servSock.listen();
-    servSock.setNonBlocking();
+    Socket serverSocket;
+    InetAddress serverAddress(config.host.c_str(), config.port);
+    serverSocket.bind(serverAddress);
+    serverSocket.listen();
+    serverSocket.setNonBlocking();
 
-    Epoll ep;
-    ep.addFd(servSock.getFd(), EPOLLIN | EPOLLET);
+    Epoll acceptorEpoll;
+    acceptorEpoll.addFd(serverSocket.getFd(), EPOLLIN | EPOLLET);
 
-    auto deadFds = std::make_shared<std::vector<std::pair<int, std::weak_ptr<HttpConnection>>>>();
-    auto deadMtx = std::make_shared<std::mutex>();
-    ThreadPool pool(config.threadCount);
-    IdleTimerManager timerManager(config.idleTimeoutMs);
-    std::unordered_map<int, std::shared_ptr<HttpConnection>> connections;
+    std::vector<std::unique_ptr<SubReactor>> subReactors;
+    subReactors.reserve(config.threadCount);
+    for (size_t i = 0; i < config.threadCount; ++i) {
+        subReactors.push_back(std::make_unique<SubReactor>(i, config, metrics, logger));
+        subReactors.back()->start();
+    }
 
     logger->info("HighPerfWebServer_Plus listening on " + config.host + ":" + std::to_string(config.port) +
-                 " with " + std::to_string(config.threadCount) + " worker threads");
+                 " with main-sub reactor model and " + std::to_string(config.threadCount) + " sub reactors");
     logger->info("static root=" + config.resourceRoot +
                  " log=" + config.logFilePath +
                  " idle_timeout_ms=" + std::to_string(config.idleTimeoutMs));
 
-    while (g_running.load()) {
-        {
-            std::lock_guard<std::mutex> lock(*deadMtx);
-            for (const auto& deadNode : *deadFds) {
-                const int deadFd = deadNode.first;
-                const auto weakConn = deadNode.second;
-                if (connections.count(deadFd) && connections[deadFd] == weakConn.lock()) {
-                    connections.erase(deadFd);
-                }
-            }
-            deadFds->clear();
-        }
-
-        for (const auto& conn : timerManager.collectExpired()) {
-            const int fd = conn->getFd();
-            if (fd == -1) {
+    size_t nextReactorIndex = 0;
+    while (gRunning.load()) {
+        std::vector<epoll_event> activeEvents;
+        acceptorEpoll.poll(activeEvents, 100);
+        for (const auto& event : activeEvents) {
+            if (event.data.fd != serverSocket.getFd()) {
                 continue;
             }
-            ep.delFd(fd);
-            conn->closeForTimeout();
-            std::lock_guard<std::mutex> lock(*deadMtx);
-            deadFds->push_back({fd, std::weak_ptr<HttpConnection>(conn)});
-        }
 
-        std::vector<epoll_event> activeEvents;
-        ep.poll(activeEvents, timerManager.nextPollTimeoutMs());
-        for (const auto& event : activeEvents) {
-            const int fd = event.data.fd;
-            if (fd == servSock.getFd()) {
-                while (true) {
-                    InetAddress clientAddr;
-                    const int clientFd = servSock.accept(clientAddr);
-                    if (clientFd == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;
-                        }
+            while (true) {
+                InetAddress clientAddress;
+                const int clientFd = serverSocket.acceptNonBlocking(clientAddress);
+                if (clientFd == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
                         break;
                     }
-
-                    metrics->onAccept();
-                    logger->info("accepted connection fd=" + std::to_string(clientFd));
-                    connections[clientFd] = std::make_shared<HttpConnection>(clientFd, config, metrics, logger);
-                    timerManager.schedule(connections[clientFd]);
-                    ep.addFd(clientFd, EPOLLIN | EPOLLET | EPOLLONESHOT | EPOLLRDHUP);
+                    logger->warn("accept failed: " + std::string(std::strerror(errno)));
+                    break;
                 }
-                continue;
-            }
 
-            if (connections.count(fd) == 0) {
-                continue;
-            }
-
-            auto conn = connections[fd];
-            if (event.events & (EPOLLERR | EPOLLHUP)) {
-                ep.delFd(fd);
-                std::lock_guard<std::mutex> lock(*deadMtx);
-                deadFds->push_back({fd, std::weak_ptr<HttpConnection>(conn)});
-                continue;
-            }
-
-            const uint32_t events = event.events;
-            pool.addTask([conn, fd, events, &ep, &timerManager, deadMtx, deadFds]() {
-                if (events & (EPOLLIN | EPOLLRDHUP)) {
-                    conn->handleRead(ep);
-                } else if (events & EPOLLOUT) {
-                    conn->handleWrite(ep);
+                metrics->onAccept();
+                if (subReactors.empty()) {
+                    logger->error("no sub reactor available, dropping fd=" + std::to_string(clientFd));
+                    ::close(clientFd);
+                    break;
                 }
-                timerManager.schedule(conn);
-                if (conn->isClosed()) {
-                    std::lock_guard<std::mutex> lock(*deadMtx);
-                    deadFds->push_back({fd, std::weak_ptr<HttpConnection>(conn)});
-                }
-            });
+
+                auto& target = subReactors[nextReactorIndex % subReactors.size()];
+                target->enqueueConnection(clientFd);
+                ++nextReactorIndex;
+            }
         }
     }
 
     logger->info("server shutting down");
+    for (auto& reactor : subReactors) {
+        reactor->stop();
+    }
     return 0;
 }

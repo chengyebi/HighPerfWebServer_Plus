@@ -17,6 +17,7 @@ add_executable(server
     src/InetAddress.cpp
     src/ServerLogger.cpp
     src/Socket.cpp
+    src/SubReactor.cpp
 )
 
 target_compile_options(server PRIVATE
