@@ -3,8 +3,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-rm -f /tmp/highperf_plus.log /tmp/highperf_plus_runtime.log
-./build_resume/server --host 127.0.0.1 --port 8888 --threads 4 --resources ./resources --log /tmp/highperf_plus.log --idle-timeout-ms 1000 >/tmp/highperf_plus_runtime.log 2>&1 &
+rm -f /tmp/highperf_plus_access.log /tmp/highperf_plus_error.log /tmp/highperf_plus_runtime.log
+./build_resume/server \
+  --host 127.0.0.1 \
+  --port 8888 \
+  --threads 4 \
+  --resources ./resources \
+  --access-log /tmp/highperf_plus_access.log \
+  --error-log /tmp/highperf_plus_error.log \
+  --idle-timeout-ms 1000 >/tmp/highperf_plus_runtime.log 2>&1 &
 SERVER_PID=$!
 
 cleanup() {
@@ -30,5 +37,7 @@ PY
 echo "--- METRICS ---"
 curl --max-time 5 http://127.0.0.1:8888/metrics
 echo
-echo "--- APP LOG ---"
-tail -n 20 /tmp/highperf_plus.log
+echo "--- ACCESS LOG ---"
+tail -n 20 /tmp/highperf_plus_access.log
+echo "--- ERROR LOG ---"
+tail -n 20 /tmp/highperf_plus_error.log
