@@ -106,7 +106,6 @@ ssize_t Buffer::readFd(int fd,int* Errno) {
     //第二块，指向栈上的临时空间
     iov[1].iov_base=extraBuff;
     iov[1].iov_len=sizeof(extraBuff);
-    const size_t iov_len=sizeof(extraBuff);
     const size_t iovcnt=(writable<sizeof(extraBuff)?2:1);
     const ssize_t len=readv(fd,iov,iovcnt);
     if (len<0) {

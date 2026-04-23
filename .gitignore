@@ -1,4 +1,6 @@
-﻿cmake-build-debug/
+cmake-build-debug/
 .idea/
 *.o
 *.exe
+build/
+build_resume/

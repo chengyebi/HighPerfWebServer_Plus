@@ -1,20 +1,28 @@
 cmake_minimum_required(VERSION 3.10)
-project(MyWebServer)
+project(HighPerfWebServer_Plus)
 
-# 设置 C++ 标准为 C++17
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 包含头文件路径,
 include_directories(include)
 
-# 生成可执行文件：名字叫 server，由 main.cpp 和 src 下的所有文件编译而来
 add_executable(server
-        main.cpp
-        src/InetAddress.cpp
-        src/Socket.cpp
-        src/Epoll.cpp
-        src/Buffer.cpp
-        src/HttpRequest.cpp
-        src/HttpConnection.cpp
+    main.cpp
+    src/Buffer.cpp
+    src/Epoll.cpp
+    src/HttpConnection.cpp
+    src/HttpRequest.cpp
+    src/InetAddress.cpp
+    src/Socket.cpp
 )
+
+target_compile_options(server PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()

@@ -1,109 +1,129 @@
-# HighPerfWebServer
+# HighPerfWebServer_Plus
 
-基于 C++11 与 Epoll 的高并发 HTTP 服务器。使用 wrk 进行单机多梯度并发压测（1k - 20k 连接），在 16 线程、2 万并发场景下，峰值吞吐量达 **200,000 QPS**，平均响应时间 105ms，P99 延迟 281ms。
+`HighPerfWebServer_Plus` 是我基于原始项目 [HighPerfWebServer](https://github.com/chengyebi/HighPerfWebServer) 做完整服务架构扩充与工程化升级后的高并发服务器 Plus 版。
 
-## 项目架构
+它不再只是一个“能跑起来的 Epoll Demo”，而是一个更适合秋招简历展示的迭代升级项目：在保留 `Epoll ET + EPOLLONESHOT + ThreadPool + Buffer + sendfile` 这些高性能核心设计的基础上，继续补齐了配置化启动、运行时指标、健康检查、静态资源服务增强、优雅退出和项目展示页面等能力。
 
-```
-HighPerfWebServer/
+## 项目定位
+
+这个版本的定位是：
+
+- 基于原版 `HighPerfWebServer` 的二次升级，而不是从零重写
+- 面向秋招简历展示，强调“从高性能网络模型到完整服务架构”的迭代思路
+- 既能讲底层 I/O 多路复用、线程池、零拷贝，也能讲服务治理和工程化能力
+
+## 相比原版的升级点
+
+1. 新增服务配置模块，支持命令行启动参数：
+   `--host`、`--port`、`--threads`、`--resources`
+2. 新增运行指标模块 `ServerMetrics`：
+   支持统计连接数、请求数、响应数、错误数、读写字节数、服务运行时长
+3. 新增内置服务接口：
+   `GET /healthz` 用于健康检查，`GET /metrics` 用于观测运行状态
+4. 增强静态资源响应能力：
+   支持 `GET / HEAD`，支持常见 MIME 类型识别，不再只返回单一 HTML
+5. 优化服务生命周期管理：
+   增加 `SIGINT / SIGTERM` 优雅退出处理，便于本地演示和压测
+6. 升级项目展示层：
+   首页从简单 Hello 页面升级为可直接用于面试演示的项目介绍页
+7. 补充工程化细节：
+   构建目录忽略、CMake 配置整理、README 重写，仓库结构更适合公开展示
+
+## 核心架构
+
+### 1. 高并发事件驱动模型
+
+- 主线程负责 `accept` 新连接并分发事件
+- 使用 `epoll` 边沿触发模式减少重复通知
+- 使用 `EPOLLONESHOT` 避免同一连接被多个 worker 并发处理
+- 工作线程池负责具体连接读写和协议处理
+
+### 2. 高性能数据收发
+
+- 读取阶段使用 `readv + Buffer`，适配 ET 模式下尽可能多地搬运数据
+- 发送静态文件时使用 `sendfile`，减少用户态与内核态之间的数据拷贝
+- 输出缓冲区与文件发送路径分离，兼顾小响应和大文件响应
+
+### 3. 连接生命周期与 ABA 风险规避
+
+- 连接对象由 `shared_ptr<HttpConnection>` 管理
+- 延迟清理阶段使用 `{fd, weak_ptr<HttpConnection>}` 做匹配
+- 避免旧 fd 关闭后被复用，导致错误删除新连接的 ABA 问题
+
+### 4. 服务治理能力补充
+
+- `/healthz` 用于服务健康检查
+- `/metrics` 用于压测时观察服务运行状态
+- 启动参数配置化，适合不同线程数和资源目录的实验
+
+## 项目结构
+
+```text
+HighPerfWebServer_Plus/
 ├── include/
-│   ├── Buffer.h          # 动态缓冲区
-│   ├── Epoll.h           # Epoll 封装
-│   ├── HttpConnection.h  # HTTP 连接管理
-│   ├── HttpRequest.h     # HTTP 请求解析
-│   ├── InetAddress.h     # 网络地址封装
-│   ├── Socket.h          # Socket RAII 封装
-│   └── ThreadPool.h      # 固定大小线程池
-├── src/
-│   ├── Buffer.cpp
-│   ├── Epoll.cpp
-│   ├── HttpConnection.cpp
-│   ├── HttpRequest.cpp
-│   ├── InetAddress.cpp
-│   └── Socket.cpp
+│   ├── Buffer.h
+│   ├── Epoll.h
+│   ├── HttpConnection.h
+│   ├── HttpRequest.h
+│   ├── InetAddress.h
+│   ├── ServerConfig.h
+│   ├── ServerMetrics.h
+│   ├── Socket.h
+│   └── ThreadPool.h
 ├── resources/
-│   └── index.html        # 静态资源目录
+├── src/
+├── CMakeLists.txt
 ├── main.cpp
-└── CMakeLists.txt
+└── README.md
 ```
 
-## 技术亮点
+## 构建运行
 
-**并发模型**
-
-采用 Epoll ET 模式结合非阻塞 I/O 实现 Reactor 架构。引入 `EPOLLONESHOT` 标志，确保同一连接在任意时刻仅由单一工作线程处理，彻底消除多线程对同一 fd 的竞态条件。
-
-**连接管理与 ABA 免疫**
-
-封装 `Socket` 类实现 RAII 资源自动管理。主线程通过 `std::weak_ptr` 配合延迟清理队列对连接存活状态进行二次校验——工作线程将死亡连接的 `{fd, weak_ptr}` 对放入死亡名单，主线程在下一轮事件循环开始前集中清理，规避高并发下 fd 被复用导致的 ABA 问题。
-
-**线程池**
-
-实现固定大小线程池，以 `std::mutex` 保护任务队列，`std::condition_variable` 精细管理线程唤醒。析构时通过手动控制 `lock_guard` 作用域，确保设置关闭标志与唤醒线程之间不存在不必要的锁竞争。
-
-**协议解析**
-
-基于有限状态机（FSM）实现 HTTP/1.1 协议解析器，状态流转为 `REQUEST_LINE → HEADERS → BODY → FINISH`。严密处理 TCP 粘包/拆包边界（`parse()` 返回 `true` 不代表请求完整，需再判断 `isComplete()`），以及 `EPOLLRDHUP` 半关闭连接的异常清理。
-
-**性能优化**
-
-- **ET 读完整性**：通过 `while` 循环非阻塞 `recv`，直至返回 `EAGAIN`，彻底抽干内核缓冲区，避免 ET 模式下的事件丢失
-- **零拷贝传输**：调用 `sendfile()` 系统调用实现内核级文件传输，绕过用户态拷贝，降低上下文切换开销
-- **分散读**：使用 `readv()` 将数据同时读入 Buffer 内部空间与栈上临时数组，减少系统调用次数
-- **Pipeline 支持**：长连接处理完一个请求后主动检查 Buffer 是否有残留数据，防止 Pipeline 模式下的连接假死
-
-## 快速开始
-
-**环境要求**：Linux 或 WSL2、GCC 7+、CMake 3.10+、wrk
+推荐在 Linux 或 WSL2 环境下运行：
 
 ```bash
-# 克隆项目
-git clone https://github.com/chengyebi/HighPerfWebServer.git
-cd HighPerfWebServer
-
-# 编译
-mkdir -p build && cd build
-cmake .. && make
+mkdir -p build
+cd build
+cmake ..
+make -j
 cd ..
 
-# 运行服务器
-ulimit -n 65535
-./build/server
+./build/server --host 0.0.0.0 --port 8888 --threads 8 --resources ./resources
 ```
 
-服务器默认监听 `127.0.0.1:8888`，静态资源放在项目根目录的 `resources/` 下。
+启动后可访问：
 
-```bash
-# 访问测试
-curl http://127.0.0.1:8888/
-```
+- `http://127.0.0.1:8888/`
+- `http://127.0.0.1:8888/healthz`
+- `http://127.0.0.1:8888/metrics`
 
-## 压测
-
-新开一个终端，执行：
+## 压测示例
 
 ```bash
 ulimit -n 65535
-wrk -t16 -c20000 -d30s --latency http://127.0.0.1:8888/
+wrk -t8 -c5000 -d15s --latency http://127.0.0.1:8888/
 ```
 
-### 压测结果（单机，WSL2 环境）
+我在当前环境下做过一轮保守压测，受 WSL 文件描述符硬限制影响，无法直接达到 `-c20000`，但在当前限制内已经完成了高并发压力验证。
 
-| 线程数 | 并发连接数 | QPS | 平均延迟 | P99 延迟 |
-|--------|-----------|-----|---------|---------|
-| 4 | 1,000 | 18,593 | - | - |
-| 8 | 5,000 | 82,252 | - | - |
-| 8 | 10,000 | 124,879 | - | - |
-| 8 | 20,000 | 183,342 | - | - |
-| 16 | 20,000 | **200,954** | 105ms | 281ms |
+## 面试可讲点
 
-## 核心模块说明
+1. 为什么 ET 模式下必须循环读取直到 `EAGAIN`
+2. `EPOLLONESHOT` 如何解决多线程 Reactor 的重复处理问题
+3. 为什么静态文件发送选择 `sendfile`
+4. 如何避免 fd 复用引起的 ABA 清理问题
+5. 为什么一个高并发服务器还需要 `/metrics` 和 `/healthz`
+6. 这个项目是如何从“高性能网络 Demo”演进成“完整服务架构 Plus 版”的
 
-| 模块 | 说明 |
-|------|------|
-| `Buffer` | 基于 `vector<char>` 的动态缓冲区，支持 `readv` 分散读与自动扩容 |
-| `Epoll` | 封装 `epoll_create1/ctl/wait`，禁止拷贝，独占 epfd 资源 |
-| `Socket` | RAII 封装 socket fd，支持移动语义，禁止拷贝，防止 double close |
-| `ThreadPool` | 固定大小线程池，`shared_ptr<Pool>` 保证线程存活期间 Pool 不被析构 |
-| `HttpRequest` | FSM 状态机解析 HTTP/1.1，支持 keep-alive 与基础路径安全校验 |
-| `HttpConnection` | 整合上述模块，管理单条连接的完整读写生命周期 |
+## 后续可继续扩展
+
+- 定时器与空闲连接回收
+- access log / error log 拆分
+- HTTP 请求体与 Chunked 解析补全
+- 主从 Reactor 架构升级
+- Benchmark 脚本自动化
+- 配置文件加载与热更新
+
+## 简历描述参考
+
+> 基于原始 HighPerfWebServer 项目进行二次架构升级，使用 C++17 实现高并发 HTTP 服务器 Plus 版；在保留 Epoll ET、EPOLLONESHOT、线程池、Buffer、sendfile 等高性能核心设计的基础上，新增服务配置模块、健康检查、运行指标统计、静态资源服务增强与优雅退出能力，提升项目工程化与服务化程度。

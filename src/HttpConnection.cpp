@@ -1,210 +1,324 @@
 #include "HttpConnection.h"
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+
 #include <cerrno>
+#include <fcntl.h>
+#include <sstream>
 #include <sys/sendfile.h>
-HttpConnection::HttpConnection(int fd)
-:socket_(fd)
-,keepAlive_(false)//默认短连接
-,fileFd_(-1)
-,fileOffset_(0)//文件发送偏移量清零
-,fileLen_(0)
-{
-   socket_.setNonBlocking();//ET模式必须搭配非阻塞
+#include <sys/stat.h>
+#include <unistd.h>
+
+namespace {
+std::string buildHeader(const std::string& status,
+                        const std::string& contentType,
+                        size_t contentLength,
+                        bool keepAlive) {
+    std::ostringstream oss;
+    oss << "HTTP/1.1 " << status << "\r\n"
+        << "Content-Type: " << contentType << "\r\n"
+        << "Content-Length: " << contentLength << "\r\n"
+        << "Connection: " << (keepAlive ? "keep-alive" : "close") << "\r\n"
+        << "Server: HighPerfWebServer/2.0\r\n\r\n";
+    return oss.str();
 }
-HttpConnection::~HttpConnection() {//析构时确保打开的文件资源被释放
-   if (fileFd_!=-1) {
-      close(fileFd_);
-      fileFd_=-1;
-   }
 }
+
+HttpConnection::HttpConnection(int fd, const ServerConfig& config, std::shared_ptr<ServerMetrics> metrics)
+    : socket_(fd),
+      keepAlive_(false),
+      headRequest_(false),
+      responseReady_(false),
+      activeTracked_(true),
+      fileFd_(-1),
+      fileOffset_(0),
+      fileLen_(0),
+      config_(config),
+      metrics_(std::move(metrics)) {
+    socket_.setNonBlocking();
+}
+
+HttpConnection::~HttpConnection() {
+    if (fileFd_ != -1) {
+        close(fileFd_);
+        fileFd_ = -1;
+    }
+    if (activeTracked_ && metrics_) {
+        metrics_->onClose();
+        activeTracked_ = false;
+    }
+}
+
 int HttpConnection::getFd() const {
-   return socket_.getFd();
+    return socket_.getFd();
 }
+
 bool HttpConnection::isClosed() const {
-   return socket_.getFd() ==-1;
+    return socket_.getFd() == -1;
 }
+
 void HttpConnection::closeConnection() {
-   socket_.close();//将fd_置为-1
+    if (socket_.getFd() != -1) {
+        socket_.close();
+        if (activeTracked_ && metrics_) {
+            metrics_->onClose();
+            activeTracked_ = false;
+        }
+    }
 }
-//IO与业务，ET模式下的非阻塞读取
+
+void HttpConnection::appendResponse(const std::string& status,
+                                    const std::string& contentType,
+                                    const std::string& body,
+                                    bool includeBody) {
+    outputBuffer_.append(buildHeader(status, contentType, body.size(), keepAlive_));
+    if (includeBody && !body.empty()) {
+        outputBuffer_.append(body);
+    }
+    responseReady_ = true;
+    if (metrics_) {
+        metrics_->onResponse();
+    }
+}
+
+void HttpConnection::serveMetrics(bool includeBody) {
+    if (metrics_) {
+        metrics_->onResponse();
+    }
+    const std::string body = metrics_ ? metrics_->toJson() : "{}";
+    outputBuffer_.append(buildHeader("200 OK", "application/json", body.size(), keepAlive_));
+    if (includeBody && !body.empty()) {
+        outputBuffer_.append(body);
+    }
+    responseReady_ = true;
+}
+
+std::string HttpConnection::resolveRequestPath() const {
+    std::string path = request_.path();
+    const auto queryPos = path.find('?');
+    if (queryPos != std::string::npos) {
+        path = path.substr(0, queryPos);
+    }
+    const auto fragmentPos = path.find('#');
+    if (fragmentPos != std::string::npos) {
+        path = path.substr(0, fragmentPos);
+    }
+    if (path.empty()) {
+        path = "/index.html";
+    }
+    return path;
+}
+
+std::string HttpConnection::detectMimeType(const std::string& path) {
+    const auto dotPos = path.find_last_of('.');
+    if (dotPos == std::string::npos) {
+        return "text/plain; charset=utf-8";
+    }
+    const std::string ext = path.substr(dotPos);
+    if (ext == ".html") return "text/html; charset=utf-8";
+    if (ext == ".css") return "text/css; charset=utf-8";
+    if (ext == ".js") return "application/javascript; charset=utf-8";
+    if (ext == ".json") return "application/json; charset=utf-8";
+    if (ext == ".txt") return "text/plain; charset=utf-8";
+    if (ext == ".svg") return "image/svg+xml";
+    if (ext == ".png") return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
+    if (ext == ".ico") return "image/x-icon";
+    return "application/octet-stream";
+}
+
 void HttpConnection::handleRead(Epoll& ep) {
-   int saveErrno=0;
-   ssize_t len=0;
-   //ET模式必须循环读取，只在状态变化时通知一次，必须读到返回-1且errno为EAGAIN或EWOULDBLOCK，表示内核缓冲区已经被抽干
-   while (true) {
-      len=inputBuffer_.readFd(socket_.getFd(),&saveErrno);
-      if (len<=0) {
-         if (saveErrno==EAGAIN||saveErrno==EWOULDBLOCK) {
-            break;//数据读没有了，直接退出循环
-         }
-         if (saveErrno==EINTR) {
-            continue;//信号中断，继续读取
-         }
-         //不是上述情况就说明是真正的错误，这个时候就要关闭连接
-         closeConnection();
-         return;
-      }
-   }
-   //这里的思路是先把所有数据一次性读取到Buffer然后再统一进行解析
-   //主要是为了防止大文件或多个文件多次到达时，解析逻辑出现错误
-   process();
+    int saveErrno = 0;
+    ssize_t len = 0;
+    while (true) {
+        len = inputBuffer_.readFd(socket_.getFd(), &saveErrno);
+        if (len > 0 && metrics_) {
+            metrics_->addBytesRead(static_cast<size_t>(len));
+        }
+        if (len <= 0) {
+            if (saveErrno == EAGAIN || saveErrno == EWOULDBLOCK) {
+                break;
+            }
+            if (saveErrno == EINTR) {
+                continue;
+            }
+            closeConnection();
+            return;
+        }
+    }
 
-   //解析完毕，若有数据要发，注册EPOLLOUT,这里同时保留了EPOLLIN!防止在发送大文件期间，客户端断开连接法FIN导致服务器无法连接
-   //从而继续向已经关闭的socke填写数据，触发SIGPIPE导致进程崩溃
-   if (outputBuffer_.readableBytes()>0||fileFd_!=-1) {
-      handleWrite(ep);
-   }
-   else {
-      // 如果没数据要发，说明是个“半包”，请求不完整
-      // 必须重新挂载 EPOLLIN，让内核等下半个包到了再通知
-      ep.modFd(socket_.getFd(), EPOLLIN | EPOLLET | EPOLLONESHOT);
-   }
+    process();
+
+    if (outputBuffer_.readableBytes() > 0 || fileFd_ != -1) {
+        handleWrite(ep);
+    } else if (!isClosed()) {
+        ep.modFd(socket_.getFd(), EPOLLIN | EPOLLET | EPOLLONESHOT | EPOLLRDHUP);
+    }
 }
-//ET模式下的非阻塞写
+
 void HttpConnection::handleWrite(Epoll& ep) {
-    ssize_t len=0;
-   int saveErrno=0;
-   while (true) {
-      //发送buffer里的数据
-   if (outputBuffer_.readableBytes()>0) {
-      while (outputBuffer_.readableBytes()>0) {
-         len=outputBuffer_.writeFd(socket_.getFd(),&saveErrno);
-         if (len<=0) {
-            if (saveErrno==EAGAIN||saveErrno==EWOULDBLOCK) {
-               ep.modFd(socket_.getFd(),EPOLLIN|EPOLLOUT|EPOLLET|EPOLLONESHOT);
-               return;
-            }
-            if (saveErrno==EINTR) {
-               continue;//信号中断，重试
-            }
-            closeConnection();//真实错误，直接关闭连接
-            return;
-         }
-      }
-   }
-   //发送大文件，真正的内核态零拷贝，有响应头发送完毕且有发送文件才执行
-   if (outputBuffer_.readableBytes()==0&&fileFd_!=-1) {
-      while (true) {
-         ssize_t sent=sendfile(socket_.getFd(),fileFd_,&fileOffset_,fileLen_-fileOffset_);
-         if(sent>0) {
-             //发送了一部分
-            if (fileOffset_>=(off_t)fileLen_) {
-               //文件彻底发完了，清理资源
-               close(fileFd_);
-               fileFd_=-1;
-               fileLen_=0;//状态清零，防止下次误判
-               fileOffset_=0;
-               break;
-            }
-            //没发完，继续循环尝试发送，直到填满发送缓冲区触发EAGAIN
-         }
-         else if (sent==-1) {
-            if (errno==EAGAIN||errno==EWOULDBLOCK) {
-               ep.modFd(socket_.getFd(),EPOLLIN|EPOLLOUT|EPOLLET| EPOLLONESHOT);
-               return;//发送缓冲区满了，等待下次EPOLLOUT
-            }
-            if (errno==EINTR) {
-               continue;//被信号中断，继续发送
-            }
-            //真实报错
-            close(fileFd_);
-            fileFd_=-1;
-            fileLen_=0;
-            closeConnection();
-            return;
-         }
-         else {
-            //sent=0,通常是对端关闭，这个时候要进行异常处理
-            close(fileFd_);
-            fileFd_=-1;
-            fileLen_=0;
-            closeConnection();
-            return;
-         }
-      }
-   }
-   //收尾工作;
-   //所有数据全部发完
-   if (outputBuffer_.readableBytes()==0&&fileFd_==-1) {
-      if (keepAlive_) {
-      //重置解析器状态，准备处理下一个请求
-         request_.init();
-         //ET模式下的粘包处理
-         /*客户端pipeline模式一次tcp发了两个请求，读事件只触发一次，第一次process只处理了第一个请求，
-          * 当第一个请求处理完毕，若buffer里还有数据第二个（请求）此时内核不会再触发EPOLLIN,因为数据早就读上来了
-          * 必须主动检查并处理残留数据，否则连接会假死
-          */
-         if (inputBuffer_.readableBytes()>0) {
-            process();//立即处理滞留的下一个请求
-            if (outputBuffer_.readableBytes()>0||fileFd_!=-1) {
-               continue;
-            }
-         }
-         //彻底空闲，安心等待下一次读事件
-         ep.modFd(socket_.getFd(),EPOLLIN|EPOLLET| EPOLLONESHOT);
-         return;
-      }
-      else {
-         //短连接，发完就关
-         closeConnection();
-         return;
-      }
-   }
-   }
-}
-//业务处理逻辑
-void HttpConnection::process() {
-   //尝试解析请求
-   if (!request_.parse(inputBuffer_)) {
-      //解析格式错误，如乱码，回复400并断开
-      std::string body="<h1>400 Bad Request</h1>";
-      outputBuffer_.append("HTTP/1.1 400 Bad Request\r\nContent-Length: "+std::to_string(body.size())+"\r\n\r\n"+body);
-      keepAlive_=false;
-      return;
-   }
-   //处理TCP拆包，parse成功不代表请求完整，如果只收到半个请求头，parse返回true但是isComplete为false
-   //此时不能处理业务，必须等待后续数据到达
-   if (!request_.isComplete()) {
-      return;
-   }
-   //业务逻辑：构建响应
-   keepAlive_ = request_.isKeepAlive();
-   std::string path=request_.path();
-   //生成 Connection 头部字符串 ---
-   std::string connStr = keepAlive_ ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
-   //因为..在Linux里是"上一级目录"，叠加足够多层就能逃到根目录，访问任意系统文件
-   //为安全起见，加一个简单的防御目录攻击的设计
-   //方法就是对于访问的目录检查是否存在..，存在就直接禁止访问
-   if (path.find("..")!=std::string::npos) {
-      std::string body="<h1>403 Forbidden</h1>";
-      outputBuffer_.append("HTTP/1.1 403 Forbidden\r\n"+ connStr+"Content-Length: "+std::to_string(body.size())+"\r\n\r\n"+body);
-      return;
-   }
-   std::string filePath="./resources"+path;
-   struct stat fileStat;
-   //查找文件
-   if (stat(filePath.c_str(),&fileStat)<0) {
-      //文件不存在，返回404
-      std::string body="<h1>404 Not Found</h1>";
-      outputBuffer_.append("HTTP/1.1 404 Not Found\r\n"+ connStr+"Content-Length: "+std::to_string(body.size())+"\r\n\r\n"+body);
-   }
-   else {
-      // 1. 先尝试打开文件
-      fileFd_ = open(filePath.c_str(), O_RDONLY);
+    ssize_t len = 0;
+    int saveErrno = 0;
 
-      if (fileFd_ < 0) {
-         // 打开失败,大概率是并发太高，文件描述符耗尽
-         // 返回 500 错误
-         std::string body = "<h1>500 Internal Server Error</h1>";
-         outputBuffer_.append("HTTP/1.1 500 Internal Server Error\r\n" + connStr + "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body);
-      } else {
-         // 文件打开了，这时可以给客户端发 200 OK
-         std::string header = "HTTP/1.1 200 OK\r\n" + connStr + "Content-Type: text/html\r\nContent-Length: " + std::to_string(fileStat.st_size) + "\r\n\r\n";
-         outputBuffer_.append(header);
-         fileLen_ = fileStat.st_size;
-         fileOffset_ = 0;
-      }
-   }
+    while (true) {
+        if (outputBuffer_.readableBytes() > 0) {
+            while (outputBuffer_.readableBytes() > 0) {
+                len = outputBuffer_.writeFd(socket_.getFd(), &saveErrno);
+                if (len > 0 && metrics_) {
+                    metrics_->addBytesWritten(static_cast<size_t>(len));
+                }
+                if (len <= 0) {
+                    if (saveErrno == EAGAIN || saveErrno == EWOULDBLOCK) {
+                        ep.modFd(socket_.getFd(), EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT | EPOLLRDHUP);
+                        return;
+                    }
+                    if (saveErrno == EINTR) {
+                        continue;
+                    }
+                    closeConnection();
+                    return;
+                }
+            }
+        }
+
+        if (outputBuffer_.readableBytes() == 0 && fileFd_ != -1) {
+            while (true) {
+                const ssize_t sent = sendfile(socket_.getFd(), fileFd_, &fileOffset_, fileLen_ - fileOffset_);
+                if (sent > 0) {
+                    if (metrics_) {
+                        metrics_->addBytesWritten(static_cast<size_t>(sent));
+                    }
+                    if (fileOffset_ >= static_cast<off_t>(fileLen_)) {
+                        close(fileFd_);
+                        fileFd_ = -1;
+                        fileLen_ = 0;
+                        fileOffset_ = 0;
+                        break;
+                    }
+                    continue;
+                }
+                if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    ep.modFd(socket_.getFd(), EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT | EPOLLRDHUP);
+                    return;
+                }
+                if (sent == -1 && errno == EINTR) {
+                    continue;
+                }
+                if (fileFd_ != -1) {
+                    close(fileFd_);
+                    fileFd_ = -1;
+                }
+                fileLen_ = 0;
+                fileOffset_ = 0;
+                closeConnection();
+                return;
+            }
+        }
+
+        if (outputBuffer_.readableBytes() == 0 && fileFd_ == -1) {
+            if (keepAlive_) {
+                request_.init();
+                responseReady_ = false;
+                if (inputBuffer_.readableBytes() > 0) {
+                    process();
+                    if (outputBuffer_.readableBytes() > 0 || fileFd_ != -1) {
+                        continue;
+                    }
+                }
+                ep.modFd(socket_.getFd(), EPOLLIN | EPOLLET | EPOLLONESHOT | EPOLLRDHUP);
+                return;
+            }
+            closeConnection();
+            return;
+        }
+    }
+}
+
+void HttpConnection::process() {
+    if (!request_.parse(inputBuffer_)) {
+        keepAlive_ = false;
+        if (metrics_) {
+            metrics_->onClientError();
+        }
+        appendResponse("400 Bad Request", "text/html; charset=utf-8", "<h1>400 Bad Request</h1>", !headRequest_);
+        return;
+    }
+    if (!request_.isComplete() || responseReady_) {
+        return;
+    }
+
+    keepAlive_ = request_.isKeepAlive();
+    headRequest_ = request_.method() == "HEAD";
+
+    if (request_.method() != "GET" && request_.method() != "HEAD") {
+        keepAlive_ = false;
+        if (metrics_) {
+            metrics_->onClientError();
+        }
+        appendResponse("405 Method Not Allowed",
+                       "text/plain; charset=utf-8",
+                       "Only GET and HEAD are supported.\n",
+                       !headRequest_);
+        return;
+    }
+
+    if (metrics_) {
+        metrics_->onRequest();
+    }
+
+    const std::string path = resolveRequestPath();
+    if (path.find("..") != std::string::npos) {
+        if (metrics_) {
+            metrics_->onClientError();
+        }
+        appendResponse("403 Forbidden", "text/html; charset=utf-8", "<h1>403 Forbidden</h1>", !headRequest_);
+        return;
+    }
+
+    if (path == "/healthz") {
+        appendResponse("200 OK", "text/plain; charset=utf-8", "ok\n", !headRequest_);
+        return;
+    }
+
+    if (path == "/metrics") {
+        serveMetrics(!headRequest_);
+        return;
+    }
+
+    const std::string filePath = config_.resourceRoot + path;
+    struct stat fileStat {};
+    if (stat(filePath.c_str(), &fileStat) < 0 || S_ISDIR(fileStat.st_mode)) {
+        if (metrics_) {
+            metrics_->onClientError();
+        }
+        appendResponse("404 Not Found", "text/html; charset=utf-8", "<h1>404 Not Found</h1>", !headRequest_);
+        return;
+    }
+
+    if (headRequest_) {
+        outputBuffer_.append(buildHeader("200 OK", detectMimeType(path), static_cast<size_t>(fileStat.st_size), keepAlive_));
+        responseReady_ = true;
+        if (metrics_) {
+            metrics_->onResponse();
+        }
+        return;
+    }
+
+    fileFd_ = open(filePath.c_str(), O_RDONLY);
+    if (fileFd_ < 0) {
+        if (metrics_) {
+            metrics_->onServerError();
+        }
+        appendResponse("500 Internal Server Error",
+                       "text/html; charset=utf-8",
+                       "<h1>500 Internal Server Error</h1>",
+                       true);
+        return;
+    }
+
+    outputBuffer_.append(buildHeader("200 OK", detectMimeType(path), static_cast<size_t>(fileStat.st_size), keepAlive_));
+    fileLen_ = static_cast<size_t>(fileStat.st_size);
+    fileOffset_ = 0;
+    responseReady_ = true;
+    if (metrics_) {
+        metrics_->onResponse();
+    }
 }
