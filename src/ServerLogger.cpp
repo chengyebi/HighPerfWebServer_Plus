@@ -5,50 +5,88 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <utility>
 
-ServerLogger::ServerLogger(const std::string& accessLogPath, const std::string& errorLogPath) {
+ServerLogger::ServerLogger(const std::string& accessLogPath, const std::string& errorLogPath)
+    : stopping_(false) {
     if (!accessLogPath.empty()) {
         accessStream_.open(accessLogPath, std::ios::app);
     }
     if (!errorLogPath.empty()) {
         errorStream_.open(errorLogPath, std::ios::app);
     }
+    worker_ = std::thread([this]() { run(); });
 }
 
-ServerLogger::~ServerLogger() = default;
-
-void ServerLogger::access(const std::string& message) {
-    logAccess(message);
-}
-
-void ServerLogger::info(const std::string& message) {
-    logErrorLike("INFO", message);
-}
-
-void ServerLogger::warn(const std::string& message) {
-    logErrorLike("WARN", message);
-}
-
-void ServerLogger::error(const std::string& message) {
-    logErrorLike("ERROR", message);
-}
-
-void ServerLogger::logAccess(const std::string& message) {
-    const std::string line = "[" + nowString() + "] [ACCESS] " + message;
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (accessStream_.is_open()) {
-        accessStream_ << line << '\n';
-        accessStream_.flush();
+ServerLogger::~ServerLogger() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+    }
+    cond_.notify_all();
+    if (worker_.joinable()) {
+        worker_.join();
     }
 }
 
-void ServerLogger::logErrorLike(const std::string& level, const std::string& message) {
-    const std::string line = "[" + nowString() + "] [" + level + "] " + message;
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::cout << line << std::endl;
-    if (errorStream_.is_open()) {
-        errorStream_ << line << '\n';
-        errorStream_.flush();
+void ServerLogger::access(const std::string& message) {
+    enqueue(LogTarget::Access, false, "[" + nowString() + "] [ACCESS] " + message);
+}
+
+void ServerLogger::info(const std::string& message) {
+    enqueue(LogTarget::Error, true, "[" + nowString() + "] [INFO] " + message);
+}
+
+void ServerLogger::warn(const std::string& message) {
+    enqueue(LogTarget::Error, true, "[" + nowString() + "] [WARN] " + message);
+}
+
+void ServerLogger::error(const std::string& message) {
+    enqueue(LogTarget::Error, true, "[" + nowString() + "] [ERROR] " + message);
+}
+
+void ServerLogger::enqueue(LogTarget target, bool echoToConsole, const std::string& line) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.push_back(LogItem{target, echoToConsole, line});
+    }
+    cond_.notify_one();
+}
+
+void ServerLogger::run() {
+    while (true) {
+        std::deque<LogItem> batch;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cond_.wait(lock, [this]() { return stopping_ || !queue_.empty(); });
+            if (stopping_ && queue_.empty()) {
+                break;
+            }
+            batch.swap(queue_);
+        }
+
+        for (const auto& item : batch) {
+            if (item.echoToConsole) {
+                std::cout << item.line << std::endl;
+            }
+
+            if (item.target == LogTarget::Access) {
+                if (accessStream_.is_open()) {
+                    accessStream_ << item.line << '\n';
+                }
+            } else {
+                if (errorStream_.is_open()) {
+                    errorStream_ << item.line << '\n';
+                }
+            }
+        }
+
+        if (accessStream_.is_open()) {
+            accessStream_.flush();
+        }
+        if (errorStream_.is_open()) {
+            errorStream_.flush();
+        }
     }
 }
 

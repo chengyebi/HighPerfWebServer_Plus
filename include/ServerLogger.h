@@ -1,8 +1,11 @@
 #pragma once
 
+#include <condition_variable>
+#include <deque>
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <thread>
 
 class ServerLogger {
 public:
@@ -18,11 +21,26 @@ public:
     void error(const std::string& message);
 
 private:
-    void logAccess(const std::string& message);
-    void logErrorLike(const std::string& level, const std::string& message);
+    enum class LogTarget {
+        Access,
+        Error
+    };
+
+    struct LogItem {
+        LogTarget target;
+        bool echoToConsole;
+        std::string line;
+    };
+
+    void enqueue(LogTarget target, bool echoToConsole, const std::string& line);
+    void run();
     static std::string nowString();
 
     std::mutex mutex_;
+    std::condition_variable cond_;
+    std::deque<LogItem> queue_;
     std::ofstream accessStream_;
     std::ofstream errorStream_;
+    bool stopping_;
+    std::thread worker_;
 };
