@@ -12,6 +12,7 @@
 #include "Epoll.h"
 #include "InetAddress.h"
 #include "ServerConfig.h"
+#include "ServerConfigLoader.h"
 #include "ServerLogger.h"
 #include "ServerMetrics.h"
 #include "Socket.h"
@@ -27,7 +28,22 @@ void handleSignal(int) {
 void printUsage(const char* program) {
     std::cout << "Usage: " << program
               << " [--host IP] [--port PORT] [--threads N] [--resources PATH]"
-              << " [--log PATH] [--idle-timeout-ms N]\n";
+              << " [--access-log PATH] [--error-log PATH] [--idle-timeout-ms N]"
+              << " [--config PATH]\n";
+}
+
+bool loadConfigFromArgs(int argc, char* argv[], ServerConfig& config) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--config" && i + 1 < argc) {
+            std::string errorMessage;
+            if (!ServerConfigLoader::loadFromFile(argv[++i], config, errorMessage)) {
+                std::cerr << errorMessage << '\n';
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool parseArgs(int argc, char* argv[], ServerConfig& config) {
@@ -41,10 +57,14 @@ bool parseArgs(int argc, char* argv[], ServerConfig& config) {
             config.threadCount = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (arg == "--resources" && i + 1 < argc) {
             config.resourceRoot = argv[++i];
-        } else if (arg == "--log" && i + 1 < argc) {
-            config.logFilePath = argv[++i];
+        } else if (arg == "--access-log" && i + 1 < argc) {
+            config.accessLogPath = argv[++i];
+        } else if (arg == "--error-log" && i + 1 < argc) {
+            config.errorLogPath = argv[++i];
         } else if (arg == "--idle-timeout-ms" && i + 1 < argc) {
             config.idleTimeoutMs = std::stoi(argv[++i]);
+        } else if (arg == "--config" && i + 1 < argc) {
+            ++i;
         } else if (arg == "--help" || arg == "-h") {
             printUsage(argv[0]);
             return false;
@@ -64,12 +84,15 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, handleSignal);
 
     ServerConfig config;
+    if (!loadConfigFromArgs(argc, argv, config)) {
+        return 1;
+    }
     if (!parseArgs(argc, argv, config)) {
         return 0;
     }
 
     auto metrics = std::make_shared<ServerMetrics>();
-    auto logger = std::make_shared<ServerLogger>(config.logFilePath);
+    auto logger = std::make_shared<ServerLogger>(config.accessLogPath, config.errorLogPath);
     if (config.threadCount == 0) {
         config.threadCount = 1;
     }
@@ -93,7 +116,8 @@ int main(int argc, char* argv[]) {
     logger->info("HighPerfWebServer_Plus listening on " + config.host + ":" + std::to_string(config.port) +
                  " with main-sub reactor model and " + std::to_string(config.threadCount) + " sub reactors");
     logger->info("static root=" + config.resourceRoot +
-                 " log=" + config.logFilePath +
+                 " access_log=" + config.accessLogPath +
+                 " error_log=" + config.errorLogPath +
                  " idle_timeout_ms=" + std::to_string(config.idleTimeoutMs));
 
     size_t nextReactorIndex = 0;

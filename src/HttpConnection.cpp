@@ -100,6 +100,17 @@ void HttpConnection::touchActivity() {
     lastActiveMs_.store(nowMs(), std::memory_order_relaxed);
 }
 
+void HttpConnection::logAccess(const std::string& method,
+                               const std::string& path,
+                               int statusCode,
+                               size_t responseBytes) {
+    if (logger_) {
+        logger_->access(method + " " + path +
+                        " -> " + std::to_string(statusCode) +
+                        " bytes=" + std::to_string(responseBytes));
+    }
+}
+
 void HttpConnection::appendResponse(const std::string& status,
                                     const std::string& contentType,
                                     const std::string& body,
@@ -279,6 +290,7 @@ void HttpConnection::process() {
             metrics_->onClientError();
         }
         appendResponse("400 Bad Request", "text/html; charset=utf-8", "<h1>400 Bad Request</h1>", !headRequest_);
+        logAccess("INVALID", "-", 400, outputBuffer_.readableBytes());
         return;
     }
     if (!request_.isComplete() || responseReady_) {
@@ -297,6 +309,7 @@ void HttpConnection::process() {
                        "text/plain; charset=utf-8",
                        "Only GET and HEAD are supported.\n",
                        !headRequest_);
+        logAccess(request_.method(), request_.path(), 405, outputBuffer_.readableBytes());
         if (logger_) {
             logger_->warn(request_.method() + " " + request_.path() + " -> 405");
         }
@@ -313,6 +326,7 @@ void HttpConnection::process() {
             metrics_->onClientError();
         }
         appendResponse("403 Forbidden", "text/html; charset=utf-8", "<h1>403 Forbidden</h1>", !headRequest_);
+        logAccess(request_.method(), path, 403, outputBuffer_.readableBytes());
         if (logger_) {
             logger_->warn(request_.method() + " " + path + " -> 403");
         }
@@ -321,11 +335,13 @@ void HttpConnection::process() {
 
     if (path == "/healthz") {
         appendResponse("200 OK", "text/plain; charset=utf-8", "ok\n", !headRequest_);
+        logAccess(request_.method(), path, 200, outputBuffer_.readableBytes());
         return;
     }
 
     if (path == "/metrics") {
         serveMetrics(!headRequest_);
+        logAccess(request_.method(), path, 200, outputBuffer_.readableBytes());
         return;
     }
 
@@ -336,6 +352,7 @@ void HttpConnection::process() {
             metrics_->onClientError();
         }
         appendResponse("404 Not Found", "text/html; charset=utf-8", "<h1>404 Not Found</h1>", !headRequest_);
+        logAccess(request_.method(), path, 404, outputBuffer_.readableBytes());
         if (logger_) {
             logger_->warn(request_.method() + " " + path + " -> 404");
         }
@@ -349,6 +366,7 @@ void HttpConnection::process() {
         if (metrics_) {
             metrics_->onResponse();
         }
+        logAccess(request_.method(), path, 200, outputBuffer_.readableBytes());
         return;
     }
 
@@ -361,6 +379,7 @@ void HttpConnection::process() {
                        "text/html; charset=utf-8",
                        "<h1>500 Internal Server Error</h1>",
                        true);
+        logAccess(request_.method(), path, 500, outputBuffer_.readableBytes());
         if (logger_) {
             logger_->error(request_.method() + " " + path + " -> 500");
         }
@@ -375,4 +394,5 @@ void HttpConnection::process() {
     if (metrics_) {
         metrics_->onResponse();
     }
+    logAccess(request_.method(), path, 200, fileLen_ + outputBuffer_.readableBytes());
 }

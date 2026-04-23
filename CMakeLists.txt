@@ -15,6 +15,7 @@ add_executable(server
     src/HttpRequest.cpp
     src/IdleTimerManager.cpp
     src/InetAddress.cpp
+    src/ServerConfigLoader.cpp
     src/ServerLogger.cpp
     src/Socket.cpp
     src/SubReactor.cpp

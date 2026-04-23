@@ -35,6 +35,10 @@ public:
 private:
     void process();
     void touchActivity();
+    void logAccess(const std::string& method,
+                   const std::string& path,
+                   int statusCode,
+                   size_t responseBytes);
     void appendResponse(const std::string& status,
                         const std::string& contentType,
                         const std::string& body,
