@@ -18,6 +18,7 @@ add_executable(server
     src/ServerConfigLoader.cpp
     src/ServerLogger.cpp
     src/Socket.cpp
+    src/StaticFileCache.cpp
     src/SubReactor.cpp
 )
 

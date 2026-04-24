@@ -13,14 +13,17 @@ constexpr uint64_t kWakeSignal = 1;
 SubReactor::SubReactor(size_t index,
                        const ServerConfig& config,
                        std::shared_ptr<ServerMetrics> metrics,
-                       std::shared_ptr<ServerLogger> logger)
+                       std::shared_ptr<ServerLogger> logger,
+                       std::shared_ptr<StaticFileCache> fileCache)
     : index_(index),
       config_(config),
       metrics_(std::move(metrics)),
       logger_(std::move(logger)),
+      fileCache_(std::move(fileCache)),
       epoll_(),
       timerManager_(config_.idleTimeoutMs),
       wakeFd_(eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
+      wakePending_(false),
       running_(false) {
     if (wakeFd_ == -1) {
         throw std::runtime_error("eventfd create error");
@@ -52,11 +55,15 @@ void SubReactor::stop() {
 }
 
 void SubReactor::enqueueConnection(int clientFd) {
+    bool shouldWake = false;
     {
         std::lock_guard<std::mutex> lock(pendingMutex_);
+        shouldWake = pendingConnections_.empty();
         pendingConnections_.push(clientFd);
     }
-    wakeup();
+    if (shouldWake && !wakePending_.exchange(true)) {
+        wakeup();
+    }
 }
 
 void SubReactor::run() {
@@ -127,10 +134,20 @@ void SubReactor::processPendingConnections() {
         const int clientFd = localQueue.front();
         localQueue.pop();
 
-        auto conn = std::make_shared<HttpConnection>(clientFd, config_, metrics_, logger_);
+        auto conn = std::make_shared<HttpConnection>(clientFd, config_, metrics_, logger_, fileCache_);
         connections_[clientFd] = conn;
         epoll_.addFd(clientFd, EPOLLIN | EPOLLET | EPOLLONESHOT | EPOLLRDHUP);
         timerManager_.schedule(conn);
+    }
+
+    wakePending_.store(false);
+    bool needsWake = false;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex_);
+        needsWake = !pendingConnections_.empty();
+    }
+    if (needsWake && !wakePending_.exchange(true)) {
+        wakeup();
     }
 }
 
@@ -161,6 +178,7 @@ void SubReactor::handleWakeup() {
         }
         break;
     }
+    wakePending_.store(false);
 }
 
 void SubReactor::wakeup() {

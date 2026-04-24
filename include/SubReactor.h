@@ -6,6 +6,7 @@
 #include "ServerConfig.h"
 #include "ServerLogger.h"
 #include "ServerMetrics.h"
+#include "StaticFileCache.h"
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -18,7 +19,8 @@ public:
     SubReactor(size_t index,
                const ServerConfig& config,
                std::shared_ptr<ServerMetrics> metrics,
-               std::shared_ptr<ServerLogger> logger);
+               std::shared_ptr<ServerLogger> logger,
+               std::shared_ptr<StaticFileCache> fileCache);
     ~SubReactor();
 
     SubReactor(const SubReactor&) = delete;
@@ -39,11 +41,13 @@ private:
     ServerConfig config_;
     std::shared_ptr<ServerMetrics> metrics_;
     std::shared_ptr<ServerLogger> logger_;
+    std::shared_ptr<StaticFileCache> fileCache_;
     Epoll epoll_;
     IdleTimerManager timerManager_;
     int wakeFd_;
     std::mutex pendingMutex_;
     std::queue<int> pendingConnections_;
+    std::atomic<bool> wakePending_;
     std::unordered_map<int, std::shared_ptr<HttpConnection>> connections_;
     std::atomic<bool> running_;
     std::thread thread_;

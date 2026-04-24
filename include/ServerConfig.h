@@ -9,7 +9,8 @@ struct ServerConfig {
     uint16_t port = 8888;
     size_t threadCount = 8;
     std::string resourceRoot = "./resources";
-    std::string accessLogPath = "./access.log";
+    std::string accessLogPath;
     std::string errorLogPath = "./error.log";
     int idleTimeoutMs = 15000;
+    std::string configFilePath;
 };

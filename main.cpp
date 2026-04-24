@@ -3,6 +3,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -16,6 +17,7 @@
 #include "ServerLogger.h"
 #include "ServerMetrics.h"
 #include "Socket.h"
+#include "StaticFileCache.h"
 #include "SubReactor.h"
 
 namespace {
@@ -76,6 +78,18 @@ bool parseArgs(int argc, char* argv[], ServerConfig& config) {
     }
     return true;
 }
+
+std::string normalizePath(const std::string& path) {
+    namespace fs = std::filesystem;
+    if (path.empty()) {
+        return path;
+    }
+    const fs::path fsPath(path);
+    if (fsPath.is_absolute()) {
+        return fsPath.lexically_normal().string();
+    }
+    return fs::absolute(fsPath).lexically_normal().string();
+}
 }
 
 int main(int argc, char* argv[]) {
@@ -90,9 +104,13 @@ int main(int argc, char* argv[]) {
     if (!parseArgs(argc, argv, config)) {
         return 0;
     }
+    config.resourceRoot = normalizePath(config.resourceRoot);
+    config.accessLogPath = normalizePath(config.accessLogPath);
+    config.errorLogPath = normalizePath(config.errorLogPath);
 
     auto metrics = std::make_shared<ServerMetrics>();
     auto logger = std::make_shared<ServerLogger>(config.accessLogPath, config.errorLogPath);
+    auto fileCache = std::make_shared<StaticFileCache>(config.resourceRoot);
     if (config.threadCount == 0) {
         config.threadCount = 1;
     }
@@ -108,8 +126,9 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::unique_ptr<SubReactor>> subReactors;
     subReactors.reserve(config.threadCount);
+    fileCache->warmup("/index.html", "text/html; charset=utf-8");
     for (size_t i = 0; i < config.threadCount; ++i) {
-        subReactors.push_back(std::make_unique<SubReactor>(i, config, metrics, logger));
+        subReactors.push_back(std::make_unique<SubReactor>(i, config, metrics, logger, fileCache));
         subReactors.back()->start();
     }
 

@@ -8,12 +8,16 @@
 #include <utility>
 
 ServerLogger::ServerLogger(const std::string& accessLogPath, const std::string& errorLogPath)
-    : stopping_(false) {
+    : accessEnabled_(false),
+      errorEnabled_(false),
+      stopping_(false) {
     if (!accessLogPath.empty()) {
         accessStream_.open(accessLogPath, std::ios::app);
+        accessEnabled_ = accessStream_.is_open();
     }
     if (!errorLogPath.empty()) {
         errorStream_.open(errorLogPath, std::ios::app);
+        errorEnabled_ = errorStream_.is_open();
     }
     worker_ = std::thread([this]() { run(); });
 }
@@ -30,6 +34,9 @@ ServerLogger::~ServerLogger() {
 }
 
 void ServerLogger::access(const std::string& message) {
+    if (!accessEnabled_) {
+        return;
+    }
     enqueue(LogTarget::Access, false, "[" + nowString() + "] [ACCESS] " + message);
 }
 
@@ -71,20 +78,20 @@ void ServerLogger::run() {
             }
 
             if (item.target == LogTarget::Access) {
-                if (accessStream_.is_open()) {
+                if (accessEnabled_) {
                     accessStream_ << item.line << '\n';
                 }
             } else {
-                if (errorStream_.is_open()) {
+                if (errorEnabled_) {
                     errorStream_ << item.line << '\n';
                 }
             }
         }
 
-        if (accessStream_.is_open()) {
+        if (accessEnabled_) {
             accessStream_.flush();
         }
-        if (errorStream_.is_open()) {
+        if (errorEnabled_) {
             errorStream_.flush();
         }
     }

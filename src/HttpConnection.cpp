@@ -31,7 +31,8 @@ std::string buildHeader(const std::string& status,
 HttpConnection::HttpConnection(int fd,
                                const ServerConfig& config,
                                std::shared_ptr<ServerMetrics> metrics,
-                               std::shared_ptr<ServerLogger> logger)
+                               std::shared_ptr<ServerLogger> logger,
+                               std::shared_ptr<StaticFileCache> fileCache)
     : socket_(fd),
       keepAlive_(false),
       headRequest_(false),
@@ -43,6 +44,7 @@ HttpConnection::HttpConnection(int fd,
       config_(config),
       metrics_(std::move(metrics)),
       logger_(std::move(logger)),
+      fileCache_(std::move(fileCache)),
       lastActiveMs_(nowMs()) {
     socket_.setNonBlocking();
 }
@@ -345,9 +347,8 @@ void HttpConnection::process() {
         return;
     }
 
-    const std::string filePath = config_.resourceRoot + path;
-    struct stat fileStat {};
-    if (stat(filePath.c_str(), &fileStat) < 0 || S_ISDIR(fileStat.st_mode)) {
+    auto cachedFile = fileCache_ ? fileCache_->get(path, detectMimeType(path)) : nullptr;
+    if (!cachedFile) {
         if (metrics_) {
             metrics_->onClientError();
         }
@@ -360,7 +361,7 @@ void HttpConnection::process() {
     }
 
     if (headRequest_) {
-        outputBuffer_.append(buildHeader("200 OK", detectMimeType(path), static_cast<size_t>(fileStat.st_size), keepAlive_));
+        outputBuffer_.append(buildHeader("200 OK", cachedFile->contentType, cachedFile->content.size(), keepAlive_));
         touchActivity();
         responseReady_ = true;
         if (metrics_) {
@@ -369,30 +370,6 @@ void HttpConnection::process() {
         logAccess(request_.method(), path, 200, outputBuffer_.readableBytes());
         return;
     }
-
-    fileFd_ = open(filePath.c_str(), O_RDONLY);
-    if (fileFd_ < 0) {
-        if (metrics_) {
-            metrics_->onServerError();
-        }
-        appendResponse("500 Internal Server Error",
-                       "text/html; charset=utf-8",
-                       "<h1>500 Internal Server Error</h1>",
-                       true);
-        logAccess(request_.method(), path, 500, outputBuffer_.readableBytes());
-        if (logger_) {
-            logger_->error(request_.method() + " " + path + " -> 500");
-        }
-        return;
-    }
-
-    outputBuffer_.append(buildHeader("200 OK", detectMimeType(path), static_cast<size_t>(fileStat.st_size), keepAlive_));
-    touchActivity();
-    fileLen_ = static_cast<size_t>(fileStat.st_size);
-    fileOffset_ = 0;
-    responseReady_ = true;
-    if (metrics_) {
-        metrics_->onResponse();
-    }
-    logAccess(request_.method(), path, 200, fileLen_ + outputBuffer_.readableBytes());
+    appendResponse("200 OK", cachedFile->contentType, cachedFile->content, true);
+    logAccess(request_.method(), path, 200, outputBuffer_.readableBytes());
 }

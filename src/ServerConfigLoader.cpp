@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <unordered_map>
 
@@ -20,11 +21,15 @@ std::string trim(const std::string& value) {
 }
 
 bool ServerConfigLoader::loadFromFile(const std::string& path, ServerConfig& config, std::string& errorMessage) {
-    std::ifstream input(path);
+    namespace fs = std::filesystem;
+    const fs::path configPath = fs::absolute(path);
+    std::ifstream input(configPath);
     if (!input.is_open()) {
         errorMessage = "failed to open config file: " + path;
         return false;
     }
+    config.configFilePath = configPath.string();
+    const fs::path configDir = configPath.parent_path();
 
     std::string line;
     size_t lineNo = 0;
@@ -46,7 +51,7 @@ bool ServerConfigLoader::loadFromFile(const std::string& path, ServerConfig& con
         }
 
         const std::string key = trim(line.substr(0, eqPos));
-        const std::string value = trim(line.substr(eqPos + 1));
+        std::string value = trim(line.substr(eqPos + 1));
         try {
             if (key == "host") {
                 config.host = value;
@@ -55,11 +60,11 @@ bool ServerConfigLoader::loadFromFile(const std::string& path, ServerConfig& con
             } else if (key == "threads") {
                 config.threadCount = static_cast<size_t>(std::stoul(value));
             } else if (key == "resources") {
-                config.resourceRoot = value;
+                config.resourceRoot = (configDir / fs::path(value)).lexically_normal().string();
             } else if (key == "access_log") {
-                config.accessLogPath = value;
+                config.accessLogPath = (configDir / fs::path(value)).lexically_normal().string();
             } else if (key == "error_log") {
-                config.errorLogPath = value;
+                config.errorLogPath = (configDir / fs::path(value)).lexically_normal().string();
             } else if (key == "idle_timeout_ms") {
                 config.idleTimeoutMs = std::stoi(value);
             }

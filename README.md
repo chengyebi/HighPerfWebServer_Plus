@@ -18,6 +18,7 @@
    支持 `--config ./server.conf`，使用轻量 `key=value` 配置格式
 3. 支持 access log / error log 分离
    正常请求流量和异常事件分开记录，更接近真实服务端部署方式
+   其中 access log 默认关闭，避免高压场景下日志本身成为吞吐瓶颈
 4. 日志刷盘升级为异步后台线程
    请求线程只负责入队，后台线程批量写入日志文件，降低同步 I/O 对热路径的影响
 5. 新增运行指标模块
@@ -127,9 +128,14 @@ host = 0.0.0.0
 port = 8888
 threads = 8
 resources = ./resources
-access_log = ./access.log
 error_log = ./error.log
 idle_timeout_ms = 15000
+```
+
+如果要显式开启 access log，可以在命令行加：
+
+```bash
+--access-log ./access.log
 ```
 
 ## 启动后接口

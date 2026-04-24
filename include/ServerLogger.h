@@ -41,6 +41,8 @@ private:
     std::deque<LogItem> queue_;
     std::ofstream accessStream_;
     std::ofstream errorStream_;
+    bool accessEnabled_;
+    bool errorEnabled_;
     bool stopping_;
     std::thread worker_;
 };

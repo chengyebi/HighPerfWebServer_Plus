@@ -7,6 +7,7 @@
 #include "ServerLogger.h"
 #include "ServerMetrics.h"
 #include "Socket.h"
+#include "StaticFileCache.h"
 #include <cstdint>
 #include <atomic>
 #include <memory>
@@ -17,7 +18,8 @@ public:
     HttpConnection(int fd,
                    const ServerConfig& config,
                    std::shared_ptr<ServerMetrics> metrics,
-                   std::shared_ptr<ServerLogger> logger);
+                   std::shared_ptr<ServerLogger> logger,
+                   std::shared_ptr<StaticFileCache> fileCache);
     ~HttpConnection();
 
     HttpConnection(const HttpConnection&) = delete;
@@ -61,5 +63,6 @@ private:
     ServerConfig config_;
     std::shared_ptr<ServerMetrics> metrics_;
     std::shared_ptr<ServerLogger> logger_;
+    std::shared_ptr<StaticFileCache> fileCache_;
     std::atomic<int64_t> lastActiveMs_;
 };
